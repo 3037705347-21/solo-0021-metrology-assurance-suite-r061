@@ -70,6 +70,20 @@ func (s *Server) recordMeasurement(writer http.ResponseWriter, request *http.Req
 	writeJSON(writer, http.StatusCreated, view)
 }
 
+func (s *Server) recordCheckpoint(writer http.ResponseWriter, request *http.Request) {
+	input, err := decodeJSON[contracts.RecordCheckpointRequest](writer, request)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	view, err := s.service.RecordCheckpoint(request.Context(), request.PathValue("id"), input)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, view)
+}
+
 func (s *Server) reopenCase(writer http.ResponseWriter, request *http.Request) {
 	input, err := decodeJSON[contracts.ReopenCaseRequest](writer, request)
 	if err != nil {

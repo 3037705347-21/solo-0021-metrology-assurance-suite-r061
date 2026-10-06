@@ -155,6 +155,94 @@
         "contracts",
         "bootstrap"
       ]
+    },
+    {
+      "id": "open-multi-checkpoint-case",
+      "name": "Open multi-checkpoint case",
+      "entry": "POST /cases",
+      "steps": [
+        "verify the device exists, is active, and has no unfinished case",
+        "validate the ordered checkpoint plan: unique codes and labels, positive tolerances",
+        "open one awaiting case with one pending checkpoint per planned point"
+      ],
+      "success": "returns an awaiting_measurement case carrying the full ordered point plan",
+      "failure": "rejects empty, duplicated, or malformed plans with invalid_input",
+      "verification": "workflowcheck opens a three-point case, reads it back, rejects bad plans, and confirms the legacy single-point contract synthesizes one default checkpoint",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
+    },
+    {
+      "id": "record-checkpoint-results",
+      "name": "Record checkpoint results",
+      "entry": "POST /cases/{id}/checkpoints",
+      "steps": [
+        "resolve the planned point and evaluate the observed value against its own nominal and tolerance",
+        "reject repeat records on a decided point and records on an un-reopened failed case",
+        "derive aggregate state from point decisions, staying open until every point passes"
+      ],
+      "success": "closes one point per request and reaches review_ready only after all points pass",
+      "failure": "returns checkpoint_not_found, checkpoint_already_recorded, or state_conflict",
+      "verification": "workflowcheck closes points sequentially, rejects duplicates and unknown points, races two technicians on one pending point with exactly one winner, and closes distinct points in parallel",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
+    },
+    {
+      "id": "rework-checkpoint",
+      "name": "Rework failed checkpoint",
+      "entry": "POST /cases/{id}/reopen",
+      "steps": [
+        "reset only failed checkpoints to pending while passed points keep their evidence",
+        "preserve every measurement attempt and the cumulative attempt count",
+        "record the retry against the same plan and close the package when it passes"
+      ],
+      "success": "returns an awaiting case whose failed points are remeasurable and passed points are untouched",
+      "failure": "returns state_conflict for a second reopen or reopening from any other state",
+      "verification": "workflowcheck fails one point, reopens, verifies passed points and failed history survive, retries the point, and confirms the attempt count",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
+    },
+    {
+      "id": "seal-checkpoint-package",
+      "name": "Seal multi-checkpoint package",
+      "entry": "POST /cases/{id}/seal",
+      "steps": [
+        "reject sealing while any checkpoint is pending or failed",
+        "freeze one sealed checkpoint per planned point with its measurement basis",
+        "create exactly one seal under concurrent reviewer requests"
+      ],
+      "success": "returns a sealed case whose seal cites the closing measurement of every point",
+      "failure": "returns state_conflict for an incomplete package or seal_exists for a repeat",
+      "verification": "workflowcheck blocks premature seals, races two sealers with exactly one winner, cross-checks every frozen point against the case, and rejects post-seal mutation",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
     }
   ],
   "complexity": {
@@ -162,8 +250,10 @@
       "state_transition",
       "resource_lifetime",
       "error_propagation",
-      "concurrency"
+      "concurrency",
+      "aggregate_invariants",
+      "traceable_rework"
     ],
-    "notes": "Case changes and audit events commit atomically; a mutex-protected repository makes duplicate and concurrent seal attempts deterministic."
+    "notes": "Case aggregate state is derived from immutable checkpoint decisions; case changes and audit events commit atomically under one repository mutation lock, so duplicate point records, premature or concurrent sealing, and unguarded rework are deterministic. Failed attempts and their measurements are retained across reopen so the final seal cites traceable evidence for every point."
   }
 }

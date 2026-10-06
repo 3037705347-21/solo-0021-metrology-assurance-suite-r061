@@ -26,6 +26,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /devices/{id}", s.device)
 	s.mux.HandleFunc("POST /cases", s.openCase)
 	s.mux.HandleFunc("GET /cases/{id}", s.caseView)
+	s.mux.HandleFunc("POST /cases/{id}/checkpoints", s.recordCheckpoint)
 	s.mux.HandleFunc("POST /cases/{id}/measurements", s.recordMeasurement)
 	s.mux.HandleFunc("POST /cases/{id}/reopen", s.reopenCase)
 	s.mux.HandleFunc("POST /cases/{id}/seal", s.sealCase)

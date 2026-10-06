@@ -78,8 +78,12 @@ func (s *Service) Device(ctx context.Context, id string) (domain.Device, error) 
 }
 
 func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest) (contracts.CaseResponse, error) {
+	plans, err := checkpointPlans(input)
+	if err != nil {
+		return contracts.CaseResponse{}, err
+	}
 	var result contracts.CaseResponse
-	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+	err = s.repository.Mutate(ctx, func(m *repository.Mutation) error {
 		deviceID := strings.TrimSpace(input.DeviceID)
 		device, exists := m.Device(deviceID)
 		if !exists {
@@ -94,8 +98,7 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 		item, err := domain.NewVerificationCase(
 			m.NextID("case"),
 			device.ID,
-			input.Nominal,
-			input.Tolerance,
+			plans,
 			input.Steward,
 			s.now(),
 		)
@@ -112,7 +115,7 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 			item.ID,
 			"case_opened",
 			item.Steward,
-			"verification case opened",
+			fmt.Sprintf("verification case opened with %d checkpoint(s)", len(item.Checkpoints)),
 			s.now(),
 		)
 		if err != nil {
@@ -123,6 +126,34 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 		return nil
 	})
 	return result, err
+}
+
+// checkpointPlans resolves an open request into a fixed point plan. An
+// explicit checkpoints array is the multi-point contract; otherwise the
+// legacy nominal/tolerance pair is synthesized into one default point.
+func checkpointPlans(input contracts.OpenCaseRequest) ([]domain.CheckpointPlan, error) {
+	if input.Checkpoints == nil {
+		return []domain.CheckpointPlan{{
+			Code:      domain.DefaultCheckpointCode,
+			Label:     domain.DefaultCheckpointCode,
+			Nominal:   input.Nominal,
+			Tolerance: input.Tolerance,
+		}}, nil
+	}
+	plans := *input.Checkpoints
+	if len(plans) == 0 {
+		return nil, fmt.Errorf("%w: checkpoints must contain at least one point", domain.ErrInvalidInput)
+	}
+	result := make([]domain.CheckpointPlan, 0, len(plans))
+	for _, plan := range plans {
+		result = append(result, domain.CheckpointPlan{
+			Code:      plan.Code,
+			Label:     plan.Label,
+			Nominal:   plan.Nominal,
+			Tolerance: plan.Tolerance,
+		})
+	}
+	return result, nil
 }
 
 func (s *Service) Case(ctx context.Context, id string) (contracts.CaseResponse, error) {
@@ -139,6 +170,18 @@ func (s *Service) Case(ctx context.Context, id string) (contracts.CaseResponse, 
 }
 
 func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input contracts.RecordMeasurementRequest) (contracts.CaseResponse, error) {
+	return s.recordAtPoint(ctx, caseID, domain.DefaultCheckpointCode, input.Observed, input.Technician)
+}
+
+func (s *Service) RecordCheckpoint(ctx context.Context, caseID string, input contracts.RecordCheckpointRequest) (contracts.CaseResponse, error) {
+	code := strings.TrimSpace(input.Code)
+	if code == "" {
+		return contracts.CaseResponse{}, fmt.Errorf("%w: checkpoint code is required", domain.ErrInvalidInput)
+	}
+	return s.recordAtPoint(ctx, caseID, code, input.Observed, input.Technician)
+}
+
+func (s *Service) recordAtPoint(ctx context.Context, caseID, pointCode string, observed float64, technician string) (contracts.CaseResponse, error) {
 	var result contracts.CaseResponse
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
 		id := strings.TrimSpace(caseID)
@@ -146,19 +189,25 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
+		point, exists := item.Checkpoint(pointCode)
+		if !exists {
+			return fmt.Errorf("%w: checkpoint %s", domain.ErrCheckpointMissing, pointCode)
+		}
 		measurement, err := domain.NewMeasurement(
 			m.NextID("measurement"),
 			item.ID,
-			input.Observed,
-			item.Nominal,
-			item.Tolerance,
-			input.Technician,
+			point.ID,
+			observed,
+			point.Nominal,
+			point.Tolerance,
+			technician,
 			s.now(),
 		)
 		if err != nil {
 			return err
 		}
-		if err := item.RecordMeasurement(measurement.Accepted, s.now()); err != nil {
+		recorded, err := item.RecordCheckpoint(pointCode, measurement, s.now())
+		if err != nil {
 			return err
 		}
 		if err := m.AppendMeasurement(measurement); err != nil {
@@ -167,11 +216,13 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if err := m.UpdateCase(item); err != nil {
 			return err
 		}
-		kind := "measurement_rejected"
-		detail := "measurement exceeded tolerance and requires another measurement"
+		kind := "checkpoint_failed"
+		detail := fmt.Sprintf("checkpoint %s (%s) measured %v against nominal %v with tolerance %v: out of tolerance",
+			recorded.Code, recorded.Label, measurement.Observed, recorded.Nominal, recorded.Tolerance)
 		if measurement.Accepted {
-			kind = "measurement_accepted"
-			detail = "measurement is within tolerance and ready for review"
+			kind = "checkpoint_passed"
+			detail = fmt.Sprintf("checkpoint %s (%s) measured %v against nominal %v with tolerance %v: within tolerance",
+				recorded.Code, recorded.Label, measurement.Observed, recorded.Nominal, recorded.Tolerance)
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
@@ -194,6 +245,11 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 }
 
 func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts.ReopenCaseRequest) (contracts.CaseResponse, error) {
+	actor := strings.TrimSpace(input.Actor)
+	reason := strings.TrimSpace(input.Reason)
+	if actor == "" || reason == "" {
+		return contracts.CaseResponse{}, fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
+	}
 	var result contracts.CaseResponse
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
 		id := strings.TrimSpace(caseID)
@@ -201,16 +257,12 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
-		if err := item.Reopen(s.now()); err != nil {
+		reset, err := item.Reopen(s.now())
+		if err != nil {
 			return err
 		}
 		if err := m.UpdateCase(item); err != nil {
 			return err
-		}
-		actor := strings.TrimSpace(input.Actor)
-		reason := strings.TrimSpace(input.Reason)
-		if actor == "" || reason == "" {
-			return fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
@@ -219,7 +271,7 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 			item.ID,
 			"case_reopened",
 			actor,
-			reason,
+			fmt.Sprintf("%s; %d failed checkpoint(s) reset for remeasurement", reason, reset),
 			s.now(),
 		)
 		if err != nil {
@@ -243,10 +295,16 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if _, exists := m.Seal(item.ID); exists {
 			return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.ID)
 		}
+		if !item.AllPassed() {
+			total, pending, _, failed := item.DecisionCounts()
+			return fmt.Errorf("%w: case cannot be sealed with %d/%d points closed (%d pending, %d failed)",
+				domain.ErrStateConflict, total-pending-failed, total, pending, failed)
+		}
 		measurement, ok := bestAcceptedMeasurement(m.Measurements(item.ID))
 		if !ok {
 			return fmt.Errorf("%w: an accepted measurement is required before sealing", domain.ErrStateConflict)
 		}
+		sealedPoints := sealedCheckpoints(item)
 		if err := item.Seal(s.now()); err != nil {
 			return err
 		}
@@ -257,6 +315,7 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			measurement.ID,
 			input.Reviewer,
 			input.Summary,
+			sealedPoints,
 			s.now(),
 		)
 		if err != nil {
@@ -275,7 +334,7 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			item.ID,
 			"case_sealed",
 			seal.Reviewer,
-			seal.Summary,
+			fmt.Sprintf("%s; %d checkpoint(s) frozen", seal.Summary, len(sealedPoints)),
 			s.now(),
 		)
 		if err != nil {
@@ -286,6 +345,28 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		return nil
 	})
 	return result, err
+}
+
+func sealedCheckpoints(item domain.VerificationCase) []domain.SealedCheckpoint {
+	points := make([]domain.SealedCheckpoint, 0, len(item.Checkpoints))
+	for _, point := range item.Checkpoints {
+		if point.Status != domain.CheckpointPassed || point.RecordedAt == nil {
+			continue
+		}
+		points = append(points, domain.SealedCheckpoint{
+			Code:          point.Code,
+			Label:         point.Label,
+			Nominal:       point.Nominal,
+			Tolerance:     point.Tolerance,
+			Observed:      point.Observed,
+			Deviation:     point.Deviation,
+			Attempts:      point.Attempts,
+			MeasurementID: point.MeasurementID,
+			Technician:    point.Technician,
+			RecordedAt:    *point.RecordedAt,
+		})
+	}
+	return points
 }
 
 func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bool) {

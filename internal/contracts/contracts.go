@@ -9,14 +9,31 @@ type RegisterDeviceRequest struct {
 	Steward  string `json:"steward"`
 }
 
-type OpenCaseRequest struct {
-	DeviceID  string  `json:"device_id"`
+// CheckpointInput defines one point of the measurement plan at case opening.
+type CheckpointInput struct {
+	Code      string  `json:"code"`
+	Label     string  `json:"label"`
 	Nominal   float64 `json:"nominal"`
 	Tolerance float64 `json:"tolerance"`
-	Steward   string  `json:"steward"`
+}
+
+type OpenCaseRequest struct {
+	DeviceID string `json:"device_id"`
+	Steward  string `json:"steward"`
+	// Nominal/Tolerance keep the single-point legacy contract. They apply only
+	// when Checkpoints is absent; both forms cannot be mixed.
+	Nominal     float64            `json:"nominal"`
+	Tolerance   float64            `json:"tolerance"`
+	Checkpoints *[]CheckpointInput `json:"checkpoints,omitempty"`
 }
 
 type RecordMeasurementRequest struct {
+	Observed   float64 `json:"observed"`
+	Technician string  `json:"technician"`
+}
+
+type RecordCheckpointRequest struct {
+	Code       string  `json:"code"`
 	Observed   float64 `json:"observed"`
 	Technician string  `json:"technician"`
 }

@@ -260,8 +260,33 @@ func cloneDevices(values map[string]domain.Device) map[string]domain.Device {
 func cloneCases(values map[string]domain.VerificationCase) map[string]domain.VerificationCase {
 	result := make(map[string]domain.VerificationCase, len(values))
 	for key, value := range values {
+		value.Checkpoints = cloneCheckpoints(value.Checkpoints)
 		result[key] = value
 	}
+	return result
+}
+
+func cloneCheckpoints(values []domain.Checkpoint) []domain.Checkpoint {
+	if values == nil {
+		return nil
+	}
+	result := make([]domain.Checkpoint, len(values))
+	for index, value := range values {
+		if value.RecordedAt != nil {
+			stamp := *value.RecordedAt
+			value.RecordedAt = &stamp
+		}
+		result[index] = value
+	}
+	return result
+}
+
+func cloneSealedCheckpoints(values []domain.SealedCheckpoint) []domain.SealedCheckpoint {
+	if values == nil {
+		return nil
+	}
+	result := make([]domain.SealedCheckpoint, len(values))
+	copy(result, values)
 	return result
 }
 
@@ -276,6 +301,7 @@ func cloneMeasurements(values map[string][]domain.Measurement) map[string][]doma
 func cloneSeals(values map[string]domain.EvidenceSeal) map[string]domain.EvidenceSeal {
 	result := make(map[string]domain.EvidenceSeal, len(values))
 	for key, value := range values {
+		value.Checkpoints = cloneSealedCheckpoints(value.Checkpoints)
 		result[key] = value
 	}
 	return result

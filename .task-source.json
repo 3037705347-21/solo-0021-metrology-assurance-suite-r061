@@ -18,26 +18,48 @@
       "id": "verification_case",
       "label": "Verification case",
       "relations": [
+        "checkpoint.case_id belongs_to verification_case.id",
         "measurement.case_id belongs_to verification_case.id",
         "evidence_seal.case_id belongs_to verification_case.id"
       ],
       "invariants": [
-        "tolerance is positive",
-        "only awaiting_measurement accepts measurements",
+        "a measurement plan defines at least one checkpoint",
+        "checkpoint codes and labels are unique within the plan",
+        "plan nominal values and tolerances are fixed at case opening",
+        "aggregate state is derived from checkpoint decisions",
         "sealed is terminal",
         "version increases on every state change"
+      ]
+    },
+    {
+      "id": "checkpoint",
+      "label": "Checkpoint",
+      "relations": [
+        "checkpoint.case_id belongs_to verification_case.id",
+        "measurement.checkpoint_id belongs_to checkpoint.id"
+      ],
+      "invariants": [
+        "tolerance is positive",
+        "a pending checkpoint accepts exactly one result until reset",
+        "failed blocks the whole case until steward reopen",
+        "passed checkpoints are not reset by reopen",
+        "attempt count accumulates across failed attempts and retries",
+        "a decided checkpoint always cites its latest measurement and technician"
       ]
     },
     {
       "id": "measurement",
       "label": "Measurement",
       "relations": [
-        "measurement.case_id belongs_to verification_case.id"
+        "measurement.case_id belongs_to verification_case.id",
+        "measurement.checkpoint_id belongs_to checkpoint.id"
       ],
       "invariants": [
-        "deviation equals observed minus nominal",
-        "accepted is true exactly when absolute deviation is within tolerance",
-        "technician and timestamp are immutable"
+        "deviation equals observed minus the checkpoint nominal",
+        "accepted is true exactly when absolute deviation is within the checkpoint tolerance",
+        "nominal and tolerance come from the plan, never from the record request",
+        "technician and timestamp are immutable",
+        "failed attempts remain in history after rework and sealing"
       ]
     },
     {
@@ -45,12 +67,16 @@
       "label": "Evidence seal",
       "relations": [
         "evidence_seal.case_id belongs_to verification_case.id",
-        "evidence_seal.measurement_id belongs_to measurement.id"
+        "evidence_seal.measurement_id belongs_to measurement.id",
+        "sealed_checkpoint.measurement_id belongs_to measurement.id"
       ],
       "invariants": [
         "one case has at most one seal",
+        "sealing requires every checkpoint to be passed",
+        "the seal freezes one sealed checkpoint per planned point",
+        "each sealed checkpoint cites the measurement that closed it",
         "only an accepted measurement may be selected",
-        "the smallest absolute deviation wins when several accepted measurements exist"
+        "the smallest absolute deviation wins for the overall reference measurement"
       ]
     }
   ],
@@ -69,6 +95,24 @@
       ]
     },
     {
+      "subject": "checkpoint",
+      "states": [
+        "pending",
+        "passed",
+        "failed"
+      ],
+      "transitions": [
+        "pending->passed",
+        "pending->failed",
+        "failed->pending"
+      ],
+      "invariants": [
+        "passed never transitions back",
+        "failed->pending happens only through verification case reopen",
+        "each attempt appends an immutable measurement"
+      ]
+    },
+    {
       "subject": "verification_case",
       "states": [
         "awaiting_measurement",
@@ -83,6 +127,7 @@
         "review_ready->sealed"
       ],
       "invariants": [
+        "state is derived from checkpoint decisions rather than stored independently",
         "sealed does not transition again",
         "each transition increments version",
         "case mutation and audit event share one atomic commit"
@@ -130,7 +175,9 @@
     },
     {
       "family": "batch mutations",
-      "occupied_by": [],
+      "occupied_by": [
+        "multi_checkpoint_measurement_plan"
+      ],
       "available": true
     }
   ],
@@ -189,6 +236,26 @@
       "workflow_id": "seal-verification",
       "description": "Concurrent reviewers may both observe a ready case; only an atomic commit that rechecks state and seal uniqueness permits one seal",
       "observable_failure": "two seals are created, or the response claims success while no sealed case is readable"
+    },
+    {
+      "workflow_id": "open-multi-checkpoint-case",
+      "description": "A multi-range device can be split into unrelated single-nominal cases or modeled as one plan of checkpoints; only one fixed plan lets the work seal as one evidence package",
+      "observable_failure": "range points cannot be tracked together or two plan points share the same code and become indistinguishable"
+    },
+    {
+      "workflow_id": "record-checkpoint-results",
+      "description": "Point limits can be taken from the technician request or from the open-time plan; only the plan prevents a technician from weakening requirements, and a decided point must reject repeat records while a failed point blocks the package",
+      "observable_failure": "a point is recorded twice, a failed point is bypassed without reopen, or the case claims review_ready while some points are still pending"
+    },
+    {
+      "workflow_id": "rework-checkpoint",
+      "description": "Reopen can reset every point or only failed points; resetting passed points destroys already accepted evidence, while deleting failed measurements breaks traceability",
+      "observable_failure": "a passed point loses its measurement after reopen, or the failed attempt disappears from the sealed history"
+    },
+    {
+      "workflow_id": "seal-checkpoint-package",
+      "description": "A seal can freeze only the last measurement or the full point set with its basis; only freezing every planned point with its closing measurement keeps the package complete and reproducible",
+      "observable_failure": "the seal omits a point, cites a different measurement than the case, or exists while a point never passed"
     }
   ]
 }
