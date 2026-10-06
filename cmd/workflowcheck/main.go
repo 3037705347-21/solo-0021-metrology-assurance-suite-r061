@@ -40,6 +40,10 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"open-multi-point-case":    checkOpenMultiPointCase,
+		"record-point-results":     checkRecordPointResults,
+		"retest-rejected-point":    checkRetestRejectedPoint,
+		"seal-multi-point-case":    checkSealMultiPointCase,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -375,6 +379,507 @@ func checkSealVerification() error {
 	return nil
 }
 
+// checkOpenMultiPointCase verifies the steward defines an ordered measurement
+// plan at opening and that bad plans are rejected before a case exists.
+func checkOpenMultiPointCase() error {
+	h := newHarness()
+	defer h.close()
+
+	deviceID, err := h.createDevice("MET-2101")
+	if err != nil {
+		return err
+	}
+	opened, err := h.openMultiPointCase(deviceID, []map[string]any{
+		{"label": "low", "nominal": 10.0, "tolerance": 0.1},
+		{"label": "mid", "nominal": 25.0, "tolerance": 0.2},
+		{"label": "high", "nominal": 50.0, "tolerance": 0.5},
+	})
+	if err != nil {
+		return err
+	}
+	caseID, err := nestedString(opened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	state, err := nestedString(opened.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != "awaiting_measurement" {
+		return fmt.Errorf("opened multi-point case state = %q", state)
+	}
+	points, err := checkpointsOf(opened.Body)
+	if err != nil {
+		return err
+	}
+	if len(points) != 3 {
+		return fmt.Errorf("plan has %d checkpoints, expected 3", len(points))
+	}
+	expected := []struct {
+		ordinal   int
+		label     string
+		nominal   float64
+		tolerance float64
+	}{
+		{1, "low", 10.0, 0.1},
+		{2, "mid", 25.0, 0.2},
+		{3, "high", 50.0, 0.5},
+	}
+	for index, want := range expected {
+		point, ok := points[index].(map[string]any)
+		if !ok {
+			return fmt.Errorf("checkpoint %d is not an object", index)
+		}
+		if got := int(point["ordinal"].(float64)); got != want.ordinal {
+			return fmt.Errorf("checkpoint %d ordinal = %d", index, got)
+		}
+		if got := point["label"].(string); got != want.label {
+			return fmt.Errorf("checkpoint %d label = %q", index, got)
+		}
+		if got := point["nominal"].(float64); got != want.nominal {
+			return fmt.Errorf("checkpoint %d nominal = %v", index, got)
+		}
+		if got := point["tolerance"].(float64); got != want.tolerance {
+			return fmt.Errorf("checkpoint %d tolerance = %v", index, got)
+		}
+		if got := point["status"].(string); got != "pending" {
+			return fmt.Errorf("checkpoint %d status = %q, expected pending", index, got)
+		}
+	}
+
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(read, http.StatusOK); err != nil {
+		return err
+	}
+
+	// Case-level nominal cannot be mixed with a checkpoint plan.
+	mixedDevice, err := h.createDevice("MET-2102")
+	if err != nil {
+		return err
+	}
+	mixed, err := h.request(http.MethodPost, "/cases", map[string]any{
+		"device_id":   mixedDevice,
+		"nominal":     25.0,
+		"tolerance":   0.5,
+		"steward":     "Qiao",
+		"checkpoints": []map[string]any{{"label": "only", "nominal": 25.0, "tolerance": 0.5}},
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(mixed, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(mixed, "invalid_input"); err != nil {
+		return err
+	}
+
+	// Duplicate point labels are rejected so each result has a unique target.
+	duplicateDevice, err := h.createDevice("MET-2103")
+	if err != nil {
+		return err
+	}
+	duplicate, err := h.request(http.MethodPost, "/cases", map[string]any{
+		"device_id": duplicateDevice,
+		"steward":   "Qiao",
+		"checkpoints": []map[string]any{
+			{"label": "mid", "nominal": 25.0, "tolerance": 0.2},
+			{"label": "mid", "nominal": 50.0, "tolerance": 0.5},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(duplicate, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(duplicate, "duplicate_checkpoint"); err != nil {
+		return err
+	}
+
+	// A non-positive tolerance on a point is rejected.
+	badDevice, err := h.createDevice("MET-2104")
+	if err != nil {
+		return err
+	}
+	bad, err := h.request(http.MethodPost, "/cases", map[string]any{
+		"device_id":   badDevice,
+		"steward":     "Qiao",
+		"checkpoints": []map[string]any{{"label": "zero", "nominal": 1.0, "tolerance": 0.0}},
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(bad, http.StatusBadRequest); err != nil {
+		return err
+	}
+	return expectErrorCode(bad, "invalid_input")
+}
+
+// checkRecordPointResults verifies point-by-point recording: accepted points
+// stay open for the others, a failed point blocks the case, a closed point
+// rejects duplicate records, and unknown points cannot fabricate work.
+func checkRecordPointResults() error {
+	h := newHarness()
+	defer h.close()
+
+	caseID, points, err := h.threePointCase("MET-2201")
+	if err != nil {
+		return err
+	}
+	lowID := pointID(points, "low")
+	midID := pointID(points, "mid")
+	highID := pointID(points, "high")
+	if lowID == "" || midID == "" || highID == "" {
+		return errors.New("checkpoint ids missing from plan")
+	}
+
+	// First point accepted: case must still be awaiting remaining points.
+	first, err := h.recordPoint(caseID, lowID, 10.05, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(first, http.StatusCreated); err != nil {
+		return err
+	}
+	if state, _ := nestedString(first.Body, "case", "state"); state != "awaiting_measurement" {
+		return fmt.Errorf("after one accepted point state = %q, expected awaiting_measurement", state)
+	}
+	firstPoints, err := checkpointsOf(first.Body)
+	if err != nil {
+		return err
+	}
+	low := firstPoints[0].(map[string]any)
+	if low["status"] != "accepted" || low["measurement_id"] == "" || low["technician"] != "Rui" {
+		return fmt.Errorf("accepted low point basis not stored: %v", low)
+	}
+
+	// Recording the same completed point again must not fabricate progress.
+	dup, err := h.recordPoint(caseID, lowID, 10.02, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(dup, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(dup, "checkpoint_closed"); err != nil {
+		return err
+	}
+
+	// A point id that does not exist cannot be recorded.
+	unknown, err := h.recordPoint(caseID, "checkpoint-9999", 25.0, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(unknown, http.StatusNotFound); err != nil {
+		return err
+	}
+	if err := expectErrorCode(unknown, "not_found"); err != nil {
+		return err
+	}
+
+	// Failing the middle point blocks the whole case: high must then be locked.
+	failed, err := h.recordPoint(caseID, midID, 25.9, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(failed, http.StatusCreated); err != nil {
+		return err
+	}
+	if state, _ := nestedString(failed.Body, "case", "state"); state != "recheck_required" {
+		return fmt.Errorf("after rejected point state = %q, expected recheck_required", state)
+	}
+	failedPoints, err := checkpointsOf(failed.Body)
+	if err != nil {
+		return err
+	}
+	failedStatuses := checkpointStatuses(failedPoints)
+	if failedStatuses["mid"] != "rejected" {
+		return fmt.Errorf("mid point status = %q, expected rejected", failedStatuses["mid"])
+	}
+	if failedStatuses["low"] != "accepted" {
+		return fmt.Errorf("low point status = %q, expected accepted to persist", failedStatuses["low"])
+	}
+	locked, err := h.recordPoint(caseID, highID, 50.1, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(locked, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(locked, "state_conflict"); err != nil {
+		return err
+	}
+
+	// Sealing while a point is rejected must fail.
+	earlySeal, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Verifier",
+		"summary":  "attempt while point rejected",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(earlySeal, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(earlySeal, "state_conflict"); err != nil {
+		return err
+	}
+
+	// Every attempt remains in the measurement history for traceability.
+	history, err := nestedSlice(failed.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(history) != 2 {
+		return fmt.Errorf("measurement history has %d entries, expected 2", len(history))
+	}
+	return nil
+}
+
+// checkRetestRejectedPoint verifies a reopen only resets rejected points while
+// accepted points keep their immutable basis, and that supplementary results
+// eventually close the whole case.
+func checkRetestRejectedPoint() error {
+	h := newHarness()
+	defer h.close()
+
+	caseID, points, err := h.threePointCaseWithFailure("MET-2301")
+	if err != nil {
+		return err
+	}
+	midID := pointID(points, "mid")
+	highID := pointID(points, "high")
+
+	reopened, err := h.request(http.MethodPost, "/cases/"+caseID+"/reopen", map[string]any{
+		"actor":  "Lin",
+		"reason": "probe was re-seated after failed mid point",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopened, http.StatusOK); err != nil {
+		return err
+	}
+	if state, _ := nestedString(reopened.Body, "case", "state"); state != "awaiting_measurement" {
+		return fmt.Errorf("reopened state = %q", state)
+	}
+	after, err := checkpointsOf(reopened.Body)
+	if err != nil {
+		return err
+	}
+	statusByLabel := checkpointStatuses(after)
+	if statusByLabel["low"] != "accepted" {
+		return fmt.Errorf("accepted low point was disturbed: %q", statusByLabel["low"])
+	}
+	if statusByLabel["mid"] != "pending" {
+		return fmt.Errorf("rejected mid point was not reset: %q", statusByLabel["mid"])
+	}
+	if statusByLabel["high"] != "pending" {
+		return fmt.Errorf("pending high point changed state: %q", statusByLabel["high"])
+	}
+
+	// The rejected attempt is preserved in history even after reset.
+	history, err := nestedSlice(reopened.Body, "measurements")
+	if len(history) != 2 {
+		return fmt.Errorf("history after reopen has %d entries, expected 2", len(history))
+	}
+
+	// Supplementary mid measurement accepted; then the last point closes plan.
+	retest, err := h.recordPoint(caseID, midID, 25.05, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(retest, http.StatusCreated); err != nil {
+		return err
+	}
+	if state, _ := nestedString(retest.Body, "case", "state"); state != "awaiting_measurement" {
+		return fmt.Errorf("after retested mid state = %q", state)
+	}
+	final, err := h.recordPoint(caseID, highID, 50.2, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(final, http.StatusCreated); err != nil {
+		return err
+	}
+	if state, _ := nestedString(final.Body, "case", "state"); state != "review_ready" {
+		return fmt.Errorf("after final point state = %q, expected review_ready", state)
+	}
+
+	// Events preserve the original rejection, the reopen, and every record.
+	events, err := h.request(http.MethodGet, "/cases/"+caseID+"/events", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(events, http.StatusOK); err != nil {
+		return err
+	}
+	if !hasEvent(events.Body, "case_reopened") {
+		return errors.New("reopen audit event is missing")
+	}
+	rejected := countEvents(events.Body, "measurement_rejected")
+	accepted := countEvents(events.Body, "measurement_accepted")
+	if rejected != 1 || accepted != 3 {
+		return fmt.Errorf("event counts accepted=3 rejected=1 expected, got accepted=%d rejected=%d", accepted, rejected)
+	}
+	return nil
+}
+
+// checkSealMultiPointCase verifies sealing is possible only once all points
+// close, the seal freezes every point basis, and concurrent completion/sealing
+// cannot produce a forged or double complete package.
+func checkSealMultiPointCase() error {
+	h := newHarness()
+	defer h.close()
+
+	// Concurrent technicians racing the same last pending point: exactly one
+	// record lands; the duplicate is rejected and the case completes once.
+	raceCaseID, racePoints, err := h.threePointCaseAcceptedFirstTwo("MET-2401")
+	if err != nil {
+		return err
+	}
+	lastID := pointID(racePoints, "high")
+	type outcome struct {
+		response apiResponse
+		err      error
+	}
+	results := make(chan outcome, 2)
+	var wait sync.WaitGroup
+	for index := 0; index < 2; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			response, err := h.recordPoint(raceCaseID, lastID, 50.05, fmt.Sprintf("Tech-%d", index+1))
+			results <- outcome{response: response, err: err}
+		}(index)
+	}
+	wait.Wait()
+	close(results)
+	successes, conflicts := 0, 0
+	for item := range results {
+		if item.err != nil {
+			return item.err
+		}
+		switch item.response.Status {
+		case http.StatusCreated:
+			successes++
+			if state, _ := nestedString(item.response.Body, "case", "state"); state != "review_ready" {
+				return fmt.Errorf("winning record did not complete the plan: %q", state)
+			}
+		case http.StatusConflict:
+			conflicts++
+		default:
+			return fmt.Errorf("unexpected concurrent record status %d: %s", item.response.Status, item.response.Raw)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		return fmt.Errorf("concurrent record outcomes: %d success, %d conflict", successes, conflicts)
+	}
+
+	// Full happy path: all three points close and one seal freezes all bases.
+	caseID, points, err := h.threePointCase("MET-2402")
+	if err != nil {
+		return err
+	}
+	if _, err := h.recordPoint(caseID, pointID(points, "low"), 10.03, "Rui"); err != nil {
+		return err
+	}
+	if _, err := h.recordPoint(caseID, pointID(points, "mid"), 25.10, "Rui"); err != nil {
+		return err
+	}
+	if _, err := h.recordPoint(caseID, pointID(points, "high"), 49.80, "Rui"); err != nil {
+		return err
+	}
+	ready, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if state, _ := nestedString(ready.Body, "case", "state"); state != "review_ready" {
+		return fmt.Errorf("ready case state = %q", state)
+	}
+
+	sealResults := make(chan outcome, 2)
+	for index := 0; index < 2; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			response, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+				"reviewer": fmt.Sprintf("Verifier-%d", index+1),
+				"summary":  "three point evidence package",
+			})
+			sealResults <- outcome{response: response, err: err}
+		}(index)
+	}
+	wait.Wait()
+	close(sealResults)
+	sealed, sealConflicts := 0, 0
+	var sealedBody map[string]any
+	for item := range sealResults {
+		if item.err != nil {
+			return item.err
+		}
+		switch item.response.Status {
+		case http.StatusCreated:
+			sealed++
+			sealedBody = item.response.Body
+		case http.StatusConflict:
+			sealConflicts++
+		default:
+			return fmt.Errorf("unexpected concurrent seal status %d: %s", item.response.Status, item.response.Raw)
+		}
+	}
+	if sealed != 1 || sealConflicts != 1 {
+		return fmt.Errorf("concurrent seal outcomes: %d success, %d conflict", sealed, sealConflicts)
+	}
+
+	frozen, err := nestedSlice(sealedBody["seal"].(map[string]any), "points")
+	if err != nil {
+		return err
+	}
+	if len(frozen) != 3 {
+		return fmt.Errorf("seal freezes %d points, expected 3", len(frozen))
+	}
+	wantLabels := map[string]bool{"low": false, "mid": false, "high": false}
+	for _, entry := range frozen {
+		point, ok := entry.(map[string]any)
+		if !ok {
+			return errors.New("frozen point is not an object")
+		}
+		label := point["label"].(string)
+		wantLabels[label] = true
+		if point["measurement_id"] == "" || point["technician"] == "" {
+			return fmt.Errorf("frozen point %q is missing its basis", label)
+		}
+	}
+	for label, found := range wantLabels {
+		if !found {
+			return fmt.Errorf("seal is missing point basis %q", label)
+		}
+	}
+
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if state, _ := nestedString(read.Body, "case", "state"); state != "sealed" {
+		return fmt.Errorf("sealed state = %q", state)
+	}
+
+	// A sealed case rejects further point records.
+	after, err := h.recordPoint(caseID, pointID(points, "low"), 10.09, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(after, http.StatusConflict); err != nil {
+		return err
+	}
+	return expectErrorCode(after, "state_conflict")
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -461,6 +966,150 @@ func (h *harness) recordMeasurement(caseID string, observed float64, technician 
 		"observed":   observed,
 		"technician": technician,
 	})
+}
+
+func (h *harness) openMultiPointCase(deviceID string, points []map[string]any) (apiResponse, error) {
+	response, err := h.request(http.MethodPost, "/cases", map[string]any{
+		"device_id":   deviceID,
+		"steward":     "Qiao",
+		"checkpoints": points,
+	})
+	if err != nil {
+		return apiResponse{}, err
+	}
+	if err := expectStatus(response, http.StatusCreated); err != nil {
+		return apiResponse{}, err
+	}
+	return response, nil
+}
+
+func (h *harness) recordPoint(caseID, checkpointID string, observed float64, technician string) (apiResponse, error) {
+	return h.request(http.MethodPost, "/cases/"+caseID+"/measurements", map[string]any{
+		"checkpoint_id": checkpointID,
+		"observed":      observed,
+		"technician":    technician,
+	})
+}
+
+// threePointCase opens a low/mid/high plan on a fresh device and returns its
+// id and the ordered checkpoints.
+func (h *harness) threePointCase(tag string) (string, []any, error) {
+	deviceID, err := h.createDevice(tag)
+	if err != nil {
+		return "", nil, err
+	}
+	opened, err := h.openMultiPointCase(deviceID, []map[string]any{
+		{"label": "low", "nominal": 10.0, "tolerance": 0.1},
+		{"label": "mid", "nominal": 25.0, "tolerance": 0.2},
+		{"label": "high", "nominal": 50.0, "tolerance": 0.5},
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	caseID, err := nestedString(opened.Body, "case", "id")
+	if err != nil {
+		return "", nil, err
+	}
+	points, err := checkpointsOf(opened.Body)
+	if err != nil {
+		return "", nil, err
+	}
+	return caseID, points, nil
+}
+
+// threePointCaseWithFailure reaches recheck_required with low accepted and mid
+// rejected; high stays pending.
+func (h *harness) threePointCaseWithFailure(tag string) (string, []any, error) {
+	caseID, points, err := h.threePointCase(tag)
+	if err != nil {
+		return "", nil, err
+	}
+	if _, err := h.recordPoint(caseID, pointID(points, "low"), 10.05, "Rui"); err != nil {
+		return "", nil, err
+	}
+	rejected, err := h.recordPoint(caseID, pointID(points, "mid"), 25.9, "Rui")
+	if err != nil {
+		return "", nil, err
+	}
+	if err := expectStatus(rejected, http.StatusCreated); err != nil {
+		return "", nil, err
+	}
+	points, err = checkpointsOf(rejected.Body)
+	if err != nil {
+		return "", nil, err
+	}
+	return caseID, points, nil
+}
+
+// threePointCaseAcceptedFirstTwo leaves only high pending, in review-eligible
+// awaiting state.
+func (h *harness) threePointCaseAcceptedFirstTwo(tag string) (string, []any, error) {
+	caseID, points, err := h.threePointCase(tag)
+	if err != nil {
+		return "", nil, err
+	}
+	if _, err := h.recordPoint(caseID, pointID(points, "low"), 10.04, "Rui"); err != nil {
+		return "", nil, err
+	}
+	mid, err := h.recordPoint(caseID, pointID(points, "mid"), 24.9, "Rui")
+	if err != nil {
+		return "", nil, err
+	}
+	if err := expectStatus(mid, http.StatusCreated); err != nil {
+		return "", nil, err
+	}
+	points, err = checkpointsOf(mid.Body)
+	if err != nil {
+		return "", nil, err
+	}
+	return caseID, points, nil
+}
+
+func checkpointsOf(body map[string]any) ([]any, error) {
+	return nestedSlice(body, "checkpoints")
+}
+
+func pointID(points []any, label string) string {
+	for _, entry := range points {
+		point, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		if point["label"] == label {
+			id, _ := point["id"].(string)
+			return id
+		}
+	}
+	return ""
+}
+
+func checkpointStatuses(points []any) map[string]string {
+	result := make(map[string]string, len(points))
+	for _, entry := range points {
+		point, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		label, _ := point["label"].(string)
+		status, _ := point["status"].(string)
+		result[label] = status
+	}
+	return result
+}
+
+func countEvents(body map[string]any, kind string) int {
+	items, err := nestedSlice(body, "events")
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, item := range items {
+		event, ok := item.(map[string]any)
+		if ok && event["kind"] == kind {
+			count++
+		}
+	}
+	return count
 }
 
 func (h *harness) rejectedCase(tag string) (string, error) {

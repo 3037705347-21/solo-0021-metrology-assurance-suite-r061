@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 
 	"example.com/solo-0021-metrology-assurance-suite/internal/domain"
@@ -12,6 +13,7 @@ type Repository struct {
 	mu           sync.RWMutex
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
+	checkpoints  map[string][]domain.Checkpoint
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
@@ -22,6 +24,7 @@ func New() *Repository {
 	return &Repository{
 		devices:      make(map[string]domain.Device),
 		cases:        make(map[string]domain.VerificationCase),
+		checkpoints:  make(map[string][]domain.Checkpoint),
 		measurements: make(map[string][]domain.Measurement),
 		seals:        make(map[string]domain.EvidenceSeal),
 		counters:     make(map[string]int),
@@ -31,6 +34,7 @@ func New() *Repository {
 type Snapshot struct {
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
+	checkpoints  map[string][]domain.Checkpoint
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
@@ -55,8 +59,23 @@ func (s Snapshot) Case(id string) (domain.VerificationCase, bool) {
 	return item, ok
 }
 
+func (s Snapshot) Checkpoints(caseID string) []domain.Checkpoint {
+	return orderedCheckpoints(s.checkpoints[caseID])
+}
+
 func (s Snapshot) Measurements(caseID string) []domain.Measurement {
 	return append([]domain.Measurement(nil), s.measurements[caseID]...)
+}
+
+func (s Snapshot) Measurement(id string) (domain.Measurement, bool) {
+	for _, items := range s.measurements {
+		for _, item := range items {
+			if item.ID == id {
+				return item, true
+			}
+		}
+	}
+	return domain.Measurement{}, false
 }
 
 func (s Snapshot) Seal(caseID string) (domain.EvidenceSeal, bool) {
@@ -93,6 +112,7 @@ func (s Snapshot) AllCases() []domain.VerificationCase {
 type Mutation struct {
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
+	checkpoints  map[string][]domain.Checkpoint
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
@@ -164,6 +184,48 @@ func (m *Mutation) ActiveCaseForDevice(deviceID string) (domain.VerificationCase
 	return domain.VerificationCase{}, false
 }
 
+// PutCheckpoints stores the immutable plan created when the case is opened.
+func (m *Mutation) PutCheckpoints(points []domain.Checkpoint) error {
+	if len(points) == 0 {
+		return fmt.Errorf("%w: case plan requires at least one checkpoint", domain.ErrInvalidInput)
+	}
+	caseID := points[0].CaseID
+	if _, exists := m.cases[caseID]; !exists {
+		return fmt.Errorf("%w: case %s", domain.ErrNotFound, caseID)
+	}
+	if _, exists := m.checkpoints[caseID]; exists {
+		return fmt.Errorf("%w: checkpoints for case %s already exist", domain.ErrStateConflict, caseID)
+	}
+	m.checkpoints[caseID] = orderedCheckpoints(points)
+	return nil
+}
+
+// ReplaceCheckpoints stores the plan after a point mutation.
+func (m *Mutation) ReplaceCheckpoints(points []domain.Checkpoint) error {
+	if len(points) == 0 {
+		return fmt.Errorf("%w: case plan requires at least one checkpoint", domain.ErrInvalidInput)
+	}
+	caseID := points[0].CaseID
+	if _, exists := m.checkpoints[caseID]; !exists {
+		return fmt.Errorf("%w: checkpoints for case %s", domain.ErrNotFound, caseID)
+	}
+	m.checkpoints[caseID] = orderedCheckpoints(points)
+	return nil
+}
+
+func (m *Mutation) Checkpoints(caseID string) []domain.Checkpoint {
+	return orderedCheckpoints(m.checkpoints[caseID])
+}
+
+func (m *Mutation) Checkpoint(caseID, checkpointID string) (domain.Checkpoint, int, bool) {
+	for index, point := range m.checkpoints[caseID] {
+		if point.ID == checkpointID {
+			return point, index, true
+		}
+	}
+	return domain.Checkpoint{}, 0, false
+}
+
 func (m *Mutation) AppendMeasurement(item domain.Measurement) error {
 	if _, exists := m.cases[item.CaseID]; !exists {
 		return fmt.Errorf("%w: case %s", domain.ErrNotFound, item.CaseID)
@@ -203,6 +265,14 @@ func (m *Mutation) Events(caseID string) []domain.AuditEvent {
 	return result
 }
 
+func orderedCheckpoints(points []domain.Checkpoint) []domain.Checkpoint {
+	result := append([]domain.Checkpoint(nil), points...)
+	sort.SliceStable(result, func(i, j int) bool {
+		return result[i].Ordinal < result[j].Ordinal
+	})
+	return result
+}
+
 func (r *Repository) Read(ctx context.Context, fn func(Snapshot) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -222,6 +292,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	next := &Mutation{
 		devices:      cloneDevices(r.devices),
 		cases:        cloneCases(r.cases),
+		checkpoints:  cloneCheckpoints(r.checkpoints),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
 		events:       append([]domain.AuditEvent(nil), r.events...),
@@ -232,6 +303,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	}
 	r.devices = next.devices
 	r.cases = next.cases
+	r.checkpoints = next.checkpoints
 	r.measurements = next.measurements
 	r.seals = next.seals
 	r.events = next.events
@@ -243,6 +315,7 @@ func (r *Repository) snapshot() Snapshot {
 	return Snapshot{
 		devices:      cloneDevices(r.devices),
 		cases:        cloneCases(r.cases),
+		checkpoints:  cloneCheckpoints(r.checkpoints),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
 		events:       append([]domain.AuditEvent(nil), r.events...),
@@ -261,6 +334,14 @@ func cloneCases(values map[string]domain.VerificationCase) map[string]domain.Ver
 	result := make(map[string]domain.VerificationCase, len(values))
 	for key, value := range values {
 		result[key] = value
+	}
+	return result
+}
+
+func cloneCheckpoints(values map[string][]domain.Checkpoint) map[string][]domain.Checkpoint {
+	result := make(map[string][]domain.Checkpoint, len(values))
+	for key, value := range values {
+		result[key] = append([]domain.Checkpoint(nil), value...)
 	}
 	return result
 }

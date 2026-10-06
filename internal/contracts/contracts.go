@@ -9,16 +9,26 @@ type RegisterDeviceRequest struct {
 	Steward  string `json:"steward"`
 }
 
-type OpenCaseRequest struct {
-	DeviceID  string  `json:"device_id"`
+// CheckpointPlanItem defines one required measurement point when opening a
+// multi-point case.
+type CheckpointPlanItem struct {
+	Label     string  `json:"label"`
 	Nominal   float64 `json:"nominal"`
 	Tolerance float64 `json:"tolerance"`
-	Steward   string  `json:"steward"`
+}
+
+type OpenCaseRequest struct {
+	DeviceID    string               `json:"device_id"`
+	Nominal     float64              `json:"nominal"`
+	Tolerance   float64              `json:"tolerance"`
+	Steward     string               `json:"steward"`
+	Checkpoints []CheckpointPlanItem `json:"checkpoints,omitempty"`
 }
 
 type RecordMeasurementRequest struct {
-	Observed   float64 `json:"observed"`
-	Technician string  `json:"technician"`
+	CheckpointID string  `json:"checkpoint_id"`
+	Observed     float64 `json:"observed"`
+	Technician   string  `json:"technician"`
 }
 
 type ReopenCaseRequest struct {
@@ -37,6 +47,7 @@ type DeviceResponse struct {
 
 type CaseResponse struct {
 	Case         domain.VerificationCase `json:"case"`
+	Checkpoints  []domain.Checkpoint     `json:"checkpoints"`
 	Measurements []domain.Measurement    `json:"measurements"`
 	Seal         *domain.EvidenceSeal    `json:"seal,omitempty"`
 	Events       []domain.AuditEvent     `json:"events"`

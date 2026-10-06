@@ -7,28 +7,32 @@ import (
 )
 
 type Measurement struct {
-	ID         string    `json:"id"`
-	CaseID     string    `json:"case_id"`
-	Observed   float64   `json:"observed"`
-	Nominal    float64   `json:"nominal"`
-	Deviation  float64   `json:"deviation"`
-	Tolerance  float64   `json:"tolerance"`
-	Accepted   bool      `json:"accepted"`
-	Technician string    `json:"technician"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID           string    `json:"id"`
+	CaseID       string    `json:"case_id"`
+	CheckpointID string    `json:"checkpoint_id"`
+	Label        string    `json:"label"`
+	Observed     float64   `json:"observed"`
+	Nominal      float64   `json:"nominal"`
+	Deviation    float64   `json:"deviation"`
+	Tolerance    float64   `json:"tolerance"`
+	Accepted     bool      `json:"accepted"`
+	Technician   string    `json:"technician"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
-func NewMeasurement(id, caseID string, observed, nominal, tolerance float64, technician string, at time.Time) (Measurement, error) {
+func NewMeasurement(id, caseID, checkpointID, label string, observed, nominal, tolerance float64, technician string, at time.Time) (Measurement, error) {
 	item := Measurement{
-		ID:         strings.TrimSpace(id),
-		CaseID:     strings.TrimSpace(caseID),
-		Observed:   observed,
-		Nominal:    nominal,
-		Deviation:  observed - nominal,
-		Tolerance:  tolerance,
-		Accepted:   abs(observed-nominal) <= tolerance,
-		Technician: strings.TrimSpace(technician),
-		CreatedAt:  at.UTC(),
+		ID:           strings.TrimSpace(id),
+		CaseID:       strings.TrimSpace(caseID),
+		CheckpointID: strings.TrimSpace(checkpointID),
+		Label:        strings.TrimSpace(label),
+		Observed:     observed,
+		Nominal:      nominal,
+		Deviation:    observed - nominal,
+		Tolerance:    tolerance,
+		Accepted:     abs(observed-nominal) <= tolerance,
+		Technician:   strings.TrimSpace(technician),
+		CreatedAt:    at.UTC(),
 	}
 	if err := item.Validate(); err != nil {
 		return Measurement{}, err
@@ -37,8 +41,8 @@ func NewMeasurement(id, caseID string, observed, nominal, tolerance float64, tec
 }
 
 func (m Measurement) Validate() error {
-	if m.ID == "" || m.CaseID == "" || m.Technician == "" {
-		return fmt.Errorf("%w: measurement id, case id, and technician are required", ErrInvalidInput)
+	if m.ID == "" || m.CaseID == "" || m.CheckpointID == "" || m.Label == "" || m.Technician == "" {
+		return fmt.Errorf("%w: measurement id, case id, checkpoint id, label, and technician are required", ErrInvalidInput)
 	}
 	if !isFinite(m.Observed) || !isFinite(m.Nominal) || !isFinite(m.Tolerance) || m.Tolerance <= 0 {
 		return fmt.Errorf("%w: observed and nominal must be finite and tolerance must be positive", ErrInvalidInput)

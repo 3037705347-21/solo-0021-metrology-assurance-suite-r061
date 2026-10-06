@@ -58,6 +58,12 @@ func errorStatus(err error) (int, string) {
 		return http.StatusConflict, "active_case_exists"
 	case errors.Is(err, domain.ErrSealAlreadyCreated):
 		return http.StatusConflict, "seal_exists"
+	case errors.Is(err, domain.ErrCheckpointComplete):
+		return http.StatusConflict, "checkpoint_closed"
+	case errors.Is(err, domain.ErrCheckpointsOpen):
+		return http.StatusConflict, "checkpoints_open"
+	case errors.Is(err, domain.ErrDuplicateCheckpoint):
+		return http.StatusBadRequest, "duplicate_checkpoint"
 	case errors.Is(err, domain.ErrStateConflict):
 		return http.StatusConflict, "state_conflict"
 	default:
